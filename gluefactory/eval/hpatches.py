@@ -1,3 +1,4 @@
+import os
 from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
@@ -23,6 +24,7 @@ from .utils import (
     eval_homography_robust,
     eval_matches_homography,
     eval_poses,
+    eval_repeatability_loc_error,
 )
 
 
@@ -31,7 +33,7 @@ class HPatchesPipeline(EvalPipeline):
         "data": {
             "batch_size": 1,
             "name": "hpatches",
-            "num_workers": 16,
+            "num_workers": os.cpu_count() // 2,
             "preprocessing": {
                 "resize": 480,  # we also resize during eval to have comparable metrics
                 "side": "short",
@@ -67,6 +69,8 @@ class HPatchesPipeline(EvalPipeline):
         "line_matches1",
         "line_matching_scores0",
         "line_matching_scores1",
+        "proj_0to1",
+        "proj_1to0",
     ]
 
     def _init(self, conf):
@@ -126,6 +130,14 @@ class HPatchesPipeline(EvalPipeline):
             # we also store the names for later reference
             results_i["names"] = data["name"][0]
             results_i["scenes"] = data["scene"][0]
+
+            # Repeatability and localization error
+            rep_loc_err = eval_repeatability_loc_error(
+                data,
+                pred,
+                match_thresholds=[1, 2, 3],
+            )
+            results_i = {**results_i, **rep_loc_err}
 
             for k, v in results_i.items():
                 results[k].append(v)

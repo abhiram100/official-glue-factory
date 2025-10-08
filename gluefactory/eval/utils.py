@@ -5,7 +5,11 @@ from kornia.geometry.homography import find_homography_dlt
 from ..geometry.depth import symmetric_reprojection_error
 from ..geometry.epipolar import generalized_epi_dist, relative_pose_error
 from ..geometry.gt_generation import IGNORE_FEATURE, gt_matches_from_pose_depth
-from ..geometry.homography import homography_corner_error, sym_homography_error
+from ..geometry.homography import (
+    homography_corner_error,
+    sym_homography_error,
+    is_inside_img,
+)
 from ..robust_estimators import load_estimator
 from ..utils.tensor import batch_to_device, index_batch
 from ..utils.tools import AUCMetric
@@ -16,7 +20,7 @@ def check_keys_recursive(d, pattern):
         {check_keys_recursive(d[k], v) for k, v in pattern.items()}
     else:
         for k in pattern:
-            assert k in d.keys()
+            assert k in d.keys(), "Key {} not found in dict".format(k)
 
 
 def get_matches_scores(kpts0, kpts1, matches0, mscores0):
@@ -335,3 +339,89 @@ def aggregate_pr_results(results, suffix=""):
     out["curve_precision" + suffix] = tp_vals / np.maximum(tp_vals + fp_vals, 1e-9)
     out["AP" + suffix] = AP(tp_vals, fp_vals) * 100
     return out
+
+
+def get_valid_kpts(proj_kpts, img_size, match_radius):
+    """
+    img_size = data["view0"]["image"].shape[-2:] = (h, w)
+    """
+    valid_mask = is_inside_img(proj_kpts, img_size, match_radius)
+    return proj_kpts[valid_mask]
+
+
+def eval_repeatability_loc_error(data, pred, match_thresholds=[1, 2, 3]):
+    loc_error_match_radius = 3
+
+    check_keys_recursive(data, ["view0", "view1"])
+    check_keys_recursive(
+        pred,
+        [
+            "keypoints0",
+            "keypoints1",
+            "proj_0to1",
+            "proj_1to0",
+            "matches0",
+            "matches1",
+        ],
+    )
+    if pred["keypoints0"].ndim > 2:
+        return eval_per_batch_item(
+            data, pred, eval_repeatability_loc_error, match_thresholds=match_thresholds
+        )
+
+    kp0, kp1 = pred["keypoints0"], pred["keypoints1"]
+    m0, m1 = pred["matches0"], pred["matches1"]
+    proj0to1, proj1to0 = pred["proj_0to1"], pred["proj_1to0"]
+    valid = m0.detach().cpu() > -1
+
+    # Repeatability
+    valid_kpts0 = get_valid_kpts(
+        proj0to1, data["view1"]["image"].shape[-2:], loc_error_match_radius
+    )
+    valid_kpts1 = get_valid_kpts(
+        proj1to0, data["view0"]["image"].shape[-2:], loc_error_match_radius
+    )
+    num_matches0 = (m0 > -1).sum().item()
+    num_matches1 = (m1 > -1).sum().item()
+    rep0 = num_matches0 / (len(valid_kpts0) + 1e-6)
+    rep1 = num_matches1 / (len(valid_kpts1) + 1e-6)
+    repeatability = (rep0 + rep1) / 2
+    kpm0, kpm1 = kp0[valid], kp1[m0[valid]]
+    proj_kpm0, proj_kpm1 = proj0to1[valid], proj1to0[m0[valid]]
+    loc_error0 = np.linalg.norm(kpm0.cpu().numpy() - proj_kpm1.cpu().numpy(), axis=1)
+    loc_error1 = np.linalg.norm(kpm1.cpu().numpy() - proj_kpm0.cpu().numpy(), axis=1)
+    loc_error0 = loc_error0[loc_error0 < 2 * loc_error_match_radius]
+    loc_error1 = loc_error1[loc_error1 < 2 * loc_error_match_radius]
+    if loc_error0.size == 0:
+        loc_error0 = np.array([loc_error_match_radius])
+    if loc_error1.size == 0:
+        loc_error1 = np.array([loc_error_match_radius])
+    loc_error = (np.mean(loc_error0) + np.mean(loc_error1)) / 2
+
+    out_dict = {"repeatability": repeatability, "localization_error": loc_error}
+
+    if match_thresholds is not None:
+        rep_dict, loc_dict = {}, {}
+        for th in match_thresholds:
+            valid0 = loc_error0 < th
+            valid1 = loc_error1 < th
+            num_valid0 = valid0.sum()
+            num_valid1 = valid1.sum()
+            rep_dict[f"repeatability@{th}px"] = (
+                (num_valid0 / (len(valid_kpts0) + 1e-6))
+                + (num_valid1 / (len(valid_kpts1) + 1e-6))
+            ) / 2
+            loc_dict[f"localization_error@{th}px"] = (
+                loc_error0[valid0].mean() + loc_error1[valid1].mean()
+            ) / 2
+
+        out_dict = {
+            **out_dict,
+            **rep_dict,
+            **loc_dict,
+        }
+
+    if repeatability > 1 or repeatability < 0:
+        print("Repeatability should be in [0, 1]")
+
+    return out_dict
