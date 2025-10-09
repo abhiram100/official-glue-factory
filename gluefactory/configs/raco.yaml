@@ -40,3 +40,7 @@ benchmarks:
     model:
       extractor:
         max_num_keypoints: 2048
+  rotation_hpatches:
+    model:
+      extractor:
+        max_num_keypoints: 200
