@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 from typing import Optional
 
@@ -9,7 +10,6 @@ from omegaconf import OmegaConf
 
 from ..base_model import BaseModel
 from .raco_model import RacoModel
-import logging
 
 to_ctr = OmegaConf.to_container  # convert DictConfig to dict
 

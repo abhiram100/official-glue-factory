@@ -7,8 +7,8 @@ from ..geometry.epipolar import generalized_epi_dist, relative_pose_error
 from ..geometry.gt_generation import IGNORE_FEATURE, gt_matches_from_pose_depth
 from ..geometry.homography import (
     homography_corner_error,
-    sym_homography_error,
     is_inside_img,
+    sym_homography_error,
 )
 from ..robust_estimators import load_estimator
 from ..utils.tensor import batch_to_device, index_batch
