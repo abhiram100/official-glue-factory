@@ -36,3 +36,7 @@ benchmarks:
     eval:
       estimator: poselib
       ransac_th: -1
+  eth3d:
+    model:
+      extractor:
+        max_num_keypoints: 2048

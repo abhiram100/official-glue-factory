@@ -1,88 +1,171 @@
+import logging
+import os
+import zipfile
 from collections import defaultdict
+from collections.abc import Iterable
+from functools import partial
 from pathlib import Path
+from pprint import pprint
 
-import matplotlib.pyplot as plt
 import numpy as np
+import torch
+from joblib import Parallel, delayed  # Import Parallel and delayed
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
+from gluefactory.utils.tensor import batch_to_device
+
 from ..datasets import get_dataset
 from ..models.cache_loader import CacheLoader
-from ..settings import EVAL_PATH
+from ..settings import DATA_PATH, EVAL_PATH
 from ..utils.export_predictions import export_predictions
-from .eval_pipeline import EvalPipeline, load_eval
+from ..visualization.viz2d import plot_cumulative
+from .eval_pipeline import EvalPipeline
 from .io import get_eval_parser, load_model, parse_eval_args
-from .utils import aggregate_pr_results, get_tp_fp_pts
+from .utils import (
+    eval_matches_epipolar,
+    eval_poses,
+    eval_relative_pose_robust,
+    eval_repeatability_loc_error,
+)
+
+logger = logging.getLogger(__name__)
 
 
-def eval_dataset(loader, pred_file, suffix=""):
-    results = defaultdict(list)
-    results["num_pos" + suffix] = 0
-    cache_loader = CacheLoader({"path": str(pred_file), "collate": None}).eval()
-    for data in tqdm(loader):
-        pred = cache_loader(data)
+# Define the worker function at the top level for multiprocessing
+def _evaluate_single_item_worker_megadepth(item_data_tuple):
+    """
+    Worker function to evaluate a single data item for MegaDepth in a separate process.
+    """
+    data_name, data_original, pred_file_path, conf_full, num_kp_list = item_data_tuple
 
-        if suffix == "":
-            scores = pred["matching_scores0"].numpy()
-            sort_indices = np.argsort(scores)[::-1]
-            gt_matches = pred["gt_matches0"].numpy()[sort_indices]
-            pred_matches = pred["matches0"].numpy()[sort_indices]
-        else:
-            scores = pred["line_matching_scores0"].numpy()
-            sort_indices = np.argsort(scores)[::-1]
-            gt_matches = pred["gt_line_matches0"].numpy()[sort_indices]
-            pred_matches = pred["line_matches0"].numpy()[sort_indices]
-        scores = scores[sort_indices]
+    # Instantiate CacheLoader within the worker process.
+    data = batch_to_device(data_original, "cpu")
+    cache_loader = CacheLoader({"path": str(pred_file_path), "collate": None}).eval()
+    pred_batched = cache_loader(data_original)
+    pred = batch_to_device(pred_batched, "cpu")
 
-        tp, fp, scores, num_pos = get_tp_fp_pts(pred_matches, gt_matches, scores)
-        results["tp" + suffix].append(tp)
-        results["fp" + suffix].append(fp)
-        results["scores" + suffix].append(scores)
-        results["num_pos" + suffix] += num_pos
+    results_i = {}
 
-    # Aggregate the results
-    return aggregate_pr_results(results, suffix=suffix)
+    # add custom evaluations here
+    results_i = eval_matches_epipolar(data, pred)
+
+    pose_results_per_item_per_threshold = defaultdict(dict)
+    test_thresholds = (
+        (
+            [conf_full.eval.ransac_th]
+            if conf_full.eval.ransac_th > 0
+            else [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+        )
+        if not isinstance(conf_full.eval.ransac_th, Iterable)
+        else conf_full.eval.ransac_th
+    )
+    for th in test_thresholds:
+        pose_results_i = eval_relative_pose_robust(
+            data,
+            pred,
+            {"estimator": conf_full.eval.estimator, "ransac_th": th},
+        )
+        # Store results for this specific item and threshold
+        for k, v in pose_results_i.items():
+            pose_results_per_item_per_threshold[th][
+                k
+            ] = v  # Assign directly, not append
+
+    # we also store the names for later reference
+    results_i["names"] = data["name"][0]
+    if "scene" in data.keys():
+        results_i["scenes"] = data["scene"][0]
+
+    # Repeatability and localization error
+    rep_loc_err = eval_repeatability_loc_error(
+        data,
+        pred,
+        match_thresholds=[1, 2, 3],
+    )
+    results_i = {**results_i, **rep_loc_err}
+
+    return results_i, pose_results_per_item_per_threshold
 
 
 class ETH3DPipeline(EvalPipeline):
     default_conf = {
         "data": {
-            "name": "eth3d",
-            "batch_size": 1,
-            "train_batch_size": 1,
-            "val_batch_size": 1,
-            "test_batch_size": 1,
-            "num_workers": 16,
+            "name": "posed_images",
+            "root": "ETH3D_undistorted_resizedx2",
+            "image_dir": "{scene}/images",
+            "depth_dir": "{scene}/ground_truth_depth_dense_9_SAM",
+            "views": "{scene}/views.txt",
+            "view_groups": "{scene}/covisibility/100pairs_5-0.1-0.9.txt",
+            "depth_format": "h5",
+            "scene_list": None,
+            "preprocessing": {
+                "resize": 1024,
+                "side": "long",
+                "interpolation": "area",
+                "antialias": False,
+            },
+            "num_workers": os.cpu_count(),
         },
         "model": {
-            "name": "gluefactory.models.two_view_pipeline",
-            "ground_truth": {
-                "name": "gluefactory.models.matchers.depth_matcher",
-                "use_lines": False,
+            "matcher": {
+                "name": "depth_matcher",
+                "th_positive": 5,
+                "th_negative": 5,
             },
-            "run_gt_in_forward": True,
+            "ground_truth": {
+                "name": None,  # no ground truth
+            },
         },
-        "eval": {"plot_methods": [], "plot_line_methods": [], "eval_lines": False},
+        "eval": {
+            "estimator": "poselib",
+            "ransac_th": -1,  # -1 runs a bunch of thresholds and selects the best
+            "rank_criterion": "keypoint_scores",  # ranker_scores or keypoint_scores
+            "run_ranking": False,  # whether to run ranking eval
+        },
     }
 
     export_keys = [
-        "gt_matches0",
+        "keypoints0",
+        "keypoints1",
+        "keypoint_scores0",
+        "keypoint_scores1",
         "matches0",
+        "matches1",
         "matching_scores0",
+        "matching_scores1",
     ]
-
     optional_export_keys = [
-        "gt_line_matches0",
-        "line_matches0",
-        "line_matching_scores0",
+        "proj_0to1",
+        "proj_1to0",
+        "ranker_scores0",
+        "ranker_scores1",
+        "depth_keypoints0",
+        "depth_keypoints1",
+        "valid_depth_keypoints0",
+        "valid_depth_keypoints1",
     ]
 
-    def get_dataloader(self, data_conf=None):
-        data_conf = data_conf if data_conf is not None else self.default_conf["data"]
-        dataset = get_dataset("eth3d")(data_conf)
+    def _init(self, conf):
+        if not (DATA_PATH / "megadepth1500").exists():
+            logger.info("Downloading the MegaDepth-1500 dataset.")
+            url = "https://cvg-data.inf.ethz.ch/megadepth/megadepth1500.zip"
+            zip_path = DATA_PATH / url.rsplit("/", 1)[-1]
+            zip_path.parent.mkdir(exist_ok=True, parents=True)
+            torch.hub.download_url_to_file(url, zip_path)
+            with zipfile.ZipFile(zip_path) as fid:
+                fid.extractall(DATA_PATH)
+            zip_path.unlink()
+
+    @classmethod
+    def get_dataloader(cls, data_conf=None):
+        """Returns a data loader with samples for each eval datapoint"""
+        data_conf = data_conf if data_conf else cls.default_conf["data"]
+        dataset = get_dataset(data_conf["name"])(data_conf)
         return dataset.get_data_loader("test")
 
     def get_predictions(self, experiment_dir, model=None, overwrite=False):
+        """Export a prediction file for each eval datapoint"""
         pred_file = experiment_dir / "predictions.h5"
         if not pred_file.exists() or overwrite:
             if model is None:
@@ -97,71 +180,79 @@ class ETH3DPipeline(EvalPipeline):
         return pred_file
 
     def run_eval(self, loader, pred_file):
-        eval_conf = self.conf.eval
-        r = eval_dataset(loader, pred_file)
-        if self.conf.eval.eval_lines:
-            r.update(eval_dataset(loader, pred_file, conf=eval_conf, suffix="_lines"))
-        s = {}
-
-        return s, {}, r
-
-
-def plot_pr_curve(
-    models_name, results, dst_file="eth3d_pr_curve.pdf", title=None, suffix=""
-):
-    plt.figure()
-    f_scores = np.linspace(0.2, 0.9, num=8)
-    for f_score in f_scores:
-        x = np.linspace(0.01, 1)
-        y = f_score * x / (2 * x - f_score)
-        plt.plot(x[y >= 0], y[y >= 0], color=[0, 0.5, 0], alpha=0.3)
-        plt.annotate(
-            "f={0:0.1}".format(f_score),
-            xy=(0.9, y[45] + 0.02),
-            alpha=0.4,
-            fontsize=14,
+        """Run the eval on cached predictions"""
+        results = defaultdict(list)
+        num_kp_list = get_ranking_num_kpts_list(
+            self.conf.model.extractor.max_num_keypoints
         )
 
-    plt.rcParams.update({"font.size": 12})
-    # plt.rc('legend', fontsize=10)
-    plt.grid(True)
-    plt.axis([0.0, 1.0, 0.0, 1.0])
-    plt.xticks(np.arange(0, 1.05, step=0.1), fontsize=16)
-    plt.xlabel("Recall", fontsize=18)
-    plt.ylabel("Precision", fontsize=18)
-    plt.yticks(np.arange(0, 1.05, step=0.1), fontsize=16)
-    plt.ylim([0.3, 1.0])
-    prop_cycle = plt.rcParams["axes.prop_cycle"]
-    colors = prop_cycle.by_key()["color"]
-    for m, c in zip(models_name, colors):
-        sAP_string = f'{m}: {results[m]["AP" + suffix]:.1f}'
-        plt.plot(
-            results[m]["curve_recall" + suffix],
-            results[m]["curve_precision" + suffix],
-            label=sAP_string,
-            color=c,
+        pose_results = defaultdict(
+            lambda: defaultdict(list)
+        )  # This will store aggregated pose results
+
+        num_processes = self.conf.data.num_workers
+        if num_processes is None or num_processes <= 0:
+            num_processes = os.cpu_count()
+
+        print(f"Running evaluation with {num_processes} processes (using joblib)...")
+
+        processed_results = Parallel(n_jobs=num_processes, verbose=0, backend="loky")(
+            delayed(_evaluate_single_item_worker_megadepth)(
+                (data_item["name"][0], data_item, pred_file, self.conf, num_kp_list)
+            )
+            for data_item in tqdm(
+                loader, total=len(loader), desc="Evaluating MegaDepth in parallel"
+            )
         )
 
-    plt.legend(fontsize=16, loc="lower right")
-    if title:
-        plt.title(title)
+        # Aggregate results from all parallel processes
+        for results_i, pose_results_per_item_per_threshold in processed_results:
+            for k, v in results_i.items():
+                results[k].append(v)
 
-    plt.tight_layout(pad=0.5)
-    print(f"Saving plot to: {dst_file}")
-    plt.savefig(dst_file)
-    plt.show()
+            # Aggregate pose results
+            for th, th_results_for_item in pose_results_per_item_per_threshold.items():
+                for k, v in th_results_for_item.items():
+                    pose_results[th][k].append(v)
+
+        # summarize results as a dict[str, float]
+        # you can also add your custom evaluations here
+        summaries = {}
+        for k, v in results.items():
+            arr = np.array(v)
+            if not np.issubdtype(np.array(v).dtype, np.number):
+                continue
+            summaries[f"m{k}"] = round(np.nanmean(arr), 3)
+
+        best_pose_results, best_th = eval_poses(
+            pose_results, auc_ths=[5, 10, 20], key="rel_pose_error"
+        )
+        results = {**results, **pose_results[best_th]}
+        summaries = {
+            **summaries,
+            **best_pose_results,
+        }
+
+        figures = {
+            "pose_recall": plot_cumulative(
+                {self.conf.eval.estimator: results["rel_pose_error"]},
+                [0, 30],
+                unit="°",
+                title="Pose ",
+            )
+        }
+
+        return summaries, figures, results
 
 
 if __name__ == "__main__":
+    from .. import logger  # overwrite the logger
+
     dataset_name = Path(__file__).stem
     parser = get_eval_parser()
     args = parser.parse_intermixed_args()
 
     default_conf = OmegaConf.create(ETH3DPipeline.default_conf)
-
-    # mingle paths
-    output_dir = Path(EVAL_PATH, dataset_name)
-    output_dir.mkdir(exist_ok=True, parents=True)
 
     name, conf = parse_eval_args(
         dataset_name,
@@ -170,33 +261,22 @@ if __name__ == "__main__":
         default_conf,
     )
 
+    # mingle paths
+    output_dir = Path(
+        EVAL_PATH, "ranking_eth3d" if conf.eval.run_ranking else dataset_name
+    )
+    output_dir.mkdir(exist_ok=True, parents=True)
+
     experiment_dir = output_dir / name
-    experiment_dir.mkdir(exist_ok=True)
+    experiment_dir.mkdir(parents=True, exist_ok=True)
 
     pipeline = ETH3DPipeline(conf)
+
     s, f, r = pipeline.run(
-        experiment_dir, overwrite=args.overwrite, overwrite_eval=args.overwrite_eval
+        experiment_dir,
+        overwrite=args.overwrite,
+        overwrite_eval=args.overwrite_eval,
     )
 
-    # print results
-    for k, v in r.items():
-        if k.startswith("AP"):
-            print(f"{k}: {v:.2f}")
-
-    if args.plot:
-        results = {}
-        for m in conf.eval.plot_methods:
-            exp_dir = output_dir / m
-            results[m] = load_eval(exp_dir)[1]
-
-        plot_pr_curve(conf.eval.plot_methods, results, dst_file="eth3d_pr_curve.pdf")
-        if conf.eval.eval_lines:
-            for m in conf.eval.plot_line_methods:
-                exp_dir = output_dir / m
-                results[m] = load_eval(exp_dir)[1]
-            plot_pr_curve(
-                conf.eval.plot_line_methods,
-                results,
-                dst_file="eth3d_pr_curve_lines.pdf",
-                suffix="_lines",
-            )
+    if not conf.eval.run_ranking:
+        pprint(s)
