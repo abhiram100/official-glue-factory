@@ -1,3 +1,4 @@
+import os
 import logging
 import zipfile
 from collections import defaultdict
@@ -23,6 +24,7 @@ from .utils import (
     eval_matches_epipolar,
     eval_poses,
     eval_relative_pose_robust,
+    eval_repeatability_loc_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,10 +40,14 @@ class MegaDepth1500Pipeline(EvalPipeline):
             "views": "{scene}/views.txt",
             "view_groups": "{scene}/pairs.txt",
             "depth_format": "h5",
-            "scene_list": ["megadepth1500"],
+            "scene_list": ["megadepth1500"],  # TODO(Abhiram): Add MegaDepth1800
             "preprocessing": {
+                "resize": 1600,
                 "side": "long",
+                "interpolation": "area",
+                "antialias": False,
             },
+            "num_workers": os.cpu_count(),
         },
         "model": {
             "ground_truth": {
@@ -128,6 +134,14 @@ class MegaDepth1500Pipeline(EvalPipeline):
             results_i["names"] = data["name"][0]
             if "scene" in data.keys():
                 results_i["scenes"] = data["scene"][0]
+
+            # Repeatability and localization error
+            rep_loc_err = eval_repeatability_loc_error(
+                data,
+                pred,
+                match_thresholds=[1, 2, 3],
+            )
+            results_i = {**results_i, **rep_loc_err}
 
             for k, v in results_i.items():
                 results[k].append(v)
