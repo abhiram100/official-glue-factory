@@ -1,8 +1,0 @@
-model:
-  name: two_view_pipeline
-  extractor:
-    name: extractors.raco
-    weights: /home/abhiram/thesis_resources/final_model_folder/ours_correct_det_rank_cov.pth
-    subpixel_sampling: true
-    ranker: true
-    covariance_estimator: true
