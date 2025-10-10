@@ -1,3 +1,8 @@
+"""
+RaCo (Ranking and Covariance) Feature Extractor
+"""
+
+import logging
 from types import SimpleNamespace
 from typing import Optional
 
@@ -9,7 +14,17 @@ from omegaconf import OmegaConf
 
 from ..base_model import BaseModel
 from .raco_model import RacoModel
-import logging
+from gluefactory.settings import DATA_PATH
+
+logger = logging.getLogger(__name__)
+
+# Configuration constants
+DEFAULT_DETECTION_THRESHOLD = -1
+DEFAULT_NMS_RADIUS = 3
+DEFAULT_MAX_KEYPOINTS = 512
+DEFAULT_SUBPIXEL_TEMP = 0.5
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 to_ctr = OmegaConf.to_container  # convert DictConfig to dict
 
@@ -17,21 +32,38 @@ to_ctr = OmegaConf.to_container  # convert DictConfig to dict
 class TanhTimesN(nn.Module):
     """
     Custom activation function that applies N * tanh(x) to the input.
-    This is used to ensure the output is in the range [-N, N].
+    Ensures output is in the range [-N, N].
+
+    Args:
+        N: Scaling factor for the tanh output (must be positive)
     """
 
-    def __init__(self, N=1.0):
+    def __init__(self, N: float = 1.0):
         super().__init__()
+        if N <= 0:
+            raise ValueError(f"N must be positive, got {N}")
         self.N = N
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.N * torch.tanh(x)
 
-    def extra_repr(self):
+    def extra_repr(self) -> str:
         return f"N={self.N}"
 
 
-def get_grid(B, H, W, device):
+def get_grid(B: int, H: int, W: int, device: torch.device) -> torch.Tensor:
+    """
+    Generate normalized coordinate grid for batch of images.
+
+    Args:
+        B: Batch size
+        H: Height
+        W: Width
+        device: Target device
+
+    Returns:
+        Grid tensor of shape (B, H*W, 2) with normalized coordinates in [-1, 1]
+    """
     x1_n = torch.meshgrid(
         *[torch.linspace(-1 + 1 / n, 1 - 1 / n, n, device=device) for n in (B, H, W)],
         indexing="ij",
@@ -40,7 +72,23 @@ def get_grid(B, H, W, device):
     return x1_n
 
 
-def extract_patches_from_inds(x: torch.Tensor, inds: torch.Tensor, patch_size: int):
+def extract_patches_from_inds(
+    x: torch.Tensor, inds: torch.Tensor, patch_size: int
+) -> torch.Tensor:
+    """
+    Extract patches from tensor at specified indices.
+
+    Args:
+        x: Input tensor of shape (B, H, W)
+        inds: Indices tensor of shape (B, N)
+        patch_size: Size of patches to extract (must be odd)
+
+    Returns:
+        Patches tensor of shape (B, patch_size**2, N)
+    """
+    if patch_size % 2 == 0:
+        raise ValueError(f"patch_size must be odd, got {patch_size}")
+
     B, H, W = x.shape
     B, N = inds.shape
     unfolder = nn.Unfold(kernel_size=patch_size, padding=patch_size // 2, stride=1)
@@ -53,169 +101,215 @@ def extract_patches_from_inds(x: torch.Tensor, inds: torch.Tensor, patch_size: i
     return patches
 
 
+def covariance_matrix_from_cholesky_elements(
+    cholesky_elements_vec: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Converts a vector of Cholesky factor elements (L11, L21, L22) of shape (..., 3)
+    to a covariance matrix of shape (..., 2, 2).
+    L = [[L11, 0], [L21, L22]]
+    Sigma = L @ L.T
+    Args:
+        cholesky_elements_vec: Tensor of shape (..., 3) where the last dimension
+                               contains [L11, L21, L22]. L11 and L22 are assumed
+                               to be positive (e.g., from exp/softplus activation).
+    Returns:
+        Tensor of shape (..., 2, 2) representing the covariance matrix.
+    """
+    L11 = cholesky_elements_vec[..., 0]
+    L21 = cholesky_elements_vec[..., 1]
+    L22 = cholesky_elements_vec[..., 2]
+
+    # Create the lower triangular L matrix (batch-wise) The elements L11 and L22 must be positive.
+    L = torch.zeros(
+        cholesky_elements_vec.shape[:-1] + (2, 2),
+        device=cholesky_elements_vec.device,
+    )
+    L[..., 0, 0] = L11
+    L[..., 1, 0] = L21
+    L[..., 1, 1] = L22
+
+    # Compute Sigma = L @ L.T
+    if cholesky_elements_vec.dim() > 1:  # If there's a batch or N dimension
+        original_shape = cholesky_elements_vec.shape[:-1]
+        L_flat = L.view(-1, 2, 2)
+        cov_matrix_flat = torch.bmm(L_flat, L_flat.transpose(-1, -2))
+        return cov_matrix_flat.view(original_shape + (2, 2))
+    else:  # Single matrix case
+        return torch.matmul(L, L.transpose(-1, -2))
+
+
 class RaCo(BaseModel):
     default_conf = {
         "name": "raco",
-        "weights": None,
+        "weights": f"{DATA_PATH}/model_checkpoints/raco.pth",
         "trainable": False,
-        "max_num_keypoints": 512,  # Inference
-        "nms_radius": 3,  # px
-        "inference_sampling": "balanced",
+        "max_num_keypoints": DEFAULT_MAX_KEYPOINTS,
+        "nms_radius": DEFAULT_NMS_RADIUS,
         "subpixel_sampling": True,  # TODO(Abhiram): handle training and inference separately
-        "reward_function": "strek",  # strek, mnn
-        "binary_reward": True,
-        "detection_threshold": -1,  # Threshold for keypoint detection
+        "detection_threshold": DEFAULT_DETECTION_THRESHOLD,
         "ranker": True,
         "covariance_estimator": True,
     }
 
-    def _init(self, conf):  # type: ignore
-
+    def _init(self, conf: dict) -> None:
+        """Initialize the RaCo model with given configuration."""
         self.conf = SimpleNamespace(**conf)
-        self.normalizer = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-        )
-        self.detection_threshold = self.conf.detection_threshold
 
-        # Set ranker and covariance_estimator flags for model initialization
-        self.ranker = self.conf.ranker
-        self.covariance_estimator = self.conf.covariance_estimator
+        # Validate configuration
+        if self.conf.nms_radius % 2 == 0:
+            raise ValueError(f"nms_radius must be odd, got {self.conf.nms_radius}")
+        if self.conf.max_num_keypoints <= 0:
+            raise ValueError(
+                f"max_num_keypoints must be positive, got {self.conf.max_num_keypoints}"
+            )
 
-        self._model_init()
+        # Setup ImageNet normalization
+        self.normalizer = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
 
-        # Load the weights if provided
-        if conf.weights is not None:
-            state_dict = torch.load(conf.weights, map_location="cpu")["model"]
-            self.load_state_dict(state_dict, strict=True)
-            logging.info(f"[RaCo] Loaded weights from {conf.weights}")
-
-    def _model_init(self):
+        # Initialize model
         self.model = RacoModel(
             {
-                "ranker": self.ranker,
-                "covariance_estimator": self.covariance_estimator,
+                "ranker": self.conf.ranker,
+                "covariance_estimator": self.conf.covariance_estimator,
             }
         )
 
-    def _balanced_sampling(
+        # Load pretrained weights if specified
+        if self.conf.weights is not None:
+            try:
+                state_dict = torch.load(self.conf.weights, map_location="cpu")["model"]
+                self.load_state_dict(state_dict, strict=True)
+                logger.info(f"[RaCo] Loaded weights from {self.conf.weights}")
+            except Exception as e:
+                logger.error(f"Failed to load weights from {self.conf.weights}: {e}")
+                raise
+
+    def _to_pixel_coords(
+        self, normalized_coords: torch.Tensor, h: int, w: int
+    ) -> torch.Tensor:
+        """
+        Convert normalized coordinates [-1, 1] to pixel coordinates.
+
+        Args:
+            normalized_coords: Tensor of shape (..., 2) with normalized coordinates
+            h: Image height
+            w: Image width
+
+        Returns:
+            Pixel coordinates tensor of same shape
+        """
+        if normalized_coords.shape[-1] != 2:
+            raise ValueError(
+                f"Expected shape (..., 2), but got {normalized_coords.shape}"
+            )
+        pixel_coords = torch.stack(
+            (
+                w * (normalized_coords[..., 0] + 1) / 2,
+                h * (normalized_coords[..., 1] + 1) / 2,
+            ),
+            dim=-1,
+        )
+        return pixel_coords
+
+    def _compute_subpixel_offsets(
+        self,
+        raw_logits: torch.Tensor,
+        inds: torch.Tensor,
+        nms_radius: int,
+        H: int,
+        W: int,
+        subpixel_temp: float = DEFAULT_SUBPIXEL_TEMP,
+    ) -> torch.Tensor:
+        """Compute subpixel offsets for keypoints using local patch softmax."""
+        B = raw_logits.shape[0]
+        device = raw_logits.device
+
+        offsets = get_grid(B, nms_radius, nms_radius, device=device).reshape(
+            B, nms_radius**2, 2
+        )
+        offsets[..., 0] = offsets[..., 0] * nms_radius / W
+        offsets[..., 1] = offsets[..., 1] * nms_radius / H
+
+        keypoint_patch_scores = extract_patches_from_inds(
+            raw_logits.squeeze(1), inds, nms_radius
+        )
+        keypoint_patch_probs = (keypoint_patch_scores / subpixel_temp).softmax(dim=1)
+        keypoint_offsets = torch.einsum("bkn, bkd ->bnd", keypoint_patch_probs, offsets)
+        return keypoint_offsets
+
+    def _sampling(
         self,
         keypoint_probs: torch.Tensor,
-        nms_radius,
-        num_kpts=None,
+        nms_radius: int,
+        num_kpts: Optional[int] = None,
         raw_logits: Optional[torch.Tensor] = None,
         subpixel: bool = False,
-        subpixel_temp: float = 0.5,
-    ):
+        subpixel_temp: float = DEFAULT_SUBPIXEL_TEMP,
+    ) -> tuple:
+        """Sample keypoints using NMS and optional subpixel refinement."""
         if num_kpts is None:
-            num_kpts = (
-                self.conf.max_sampled_keypoints
-                if self.training
-                else self.conf.max_num_keypoints
-            )
-
-        def to_pixel_coords(normalized_coords, h, w) -> torch.Tensor:
-            if normalized_coords.shape[-1] != 2:
-                raise ValueError(
-                    f"Expected shape (..., 2), but got {normalized_coords.shape}"
-                )
-            pixel_coords = torch.stack(
-                (
-                    w * (normalized_coords[..., 0] + 1) / 2,
-                    h * (normalized_coords[..., 1] + 1) / 2,
-                ),
-                dim=-1,
-            )
-            return pixel_coords
+            num_kpts = self.conf.max_num_keypoints
 
         B, C, H, W = keypoint_probs.size()
         device = keypoint_probs.device
 
-        increase_coverage = self.training
-        if increase_coverage:
-            coverage_pow = 1 / 2
-            coverage_size = 51
-            weights = (
-                -(torch.linspace(-2, 2, steps=coverage_size, device=device) ** 2)
-            ).exp()[None, None]
-            # 10000 is just some number for maybe numerical stability, who knows. :), result is invariant anyway
-            local_density_x = F.conv2d(
-                (keypoint_probs + 1e-6) * 10000,
-                weights[..., None, :],
-                padding=(0, coverage_size // 2),
-            )
-            local_density = F.conv2d(
-                local_density_x, weights[..., None], padding=(coverage_size // 2, 0)
-            )[:, 0]
-            keypoint_probs = keypoint_probs * (local_density.unsqueeze(1) + 1e-8) ** (
-                -coverage_pow
-            )
+        # Generate coordinate grid
         grid = get_grid(B, H, W, device=device).reshape(B, H * W, 2)
 
-        assert nms_radius % 2 == 1, "nms_radius should be odd"
-        keypoint_probs = keypoint_probs * (
-            keypoint_probs
-            == F.max_pool2d(
-                keypoint_probs, nms_radius, stride=1, padding=nms_radius // 2
-            )
+        # Apply NMS
+        if nms_radius % 2 != 1:
+            raise ValueError("nms_radius should be odd")
+        max_pooled = F.max_pool2d(
+            keypoint_probs, nms_radius, stride=1, padding=nms_radius // 2
         )
+        keypoint_probs = keypoint_probs * (keypoint_probs == max_pooled)
 
+        # Sample top keypoints
         inds = torch.topk(keypoint_probs.reshape(B, H * W), k=num_kpts).indices
         kps = torch.gather(grid, dim=1, index=inds[..., None].expand(B, num_kpts, 2))
-        # TODO(Abhiram): handle training and inference separately
-        if subpixel:
-            offsets = get_grid(B, nms_radius, nms_radius, device=device).reshape(
-                B, nms_radius**2, 2
-            )  # B x K_H x K_W x 2
-            offsets[..., 0] = offsets[..., 0] * nms_radius / W
-            offsets[..., 1] = offsets[..., 1] * nms_radius / H
-            keypoint_patch_scores = extract_patches_from_inds(
-                raw_logits.squeeze(1), inds, nms_radius
-            )
-            keypoint_patch_probs = (keypoint_patch_scores / subpixel_temp).softmax(
-                dim=1
-            )  # B x K_H * K_W x N
-            keypoint_offsets = torch.einsum(
-                "bkn, bkd ->bnd", keypoint_patch_probs, offsets
+
+        # Compute subpixel refinement if requested
+        if subpixel and raw_logits is not None:
+            keypoint_offsets = self._compute_subpixel_offsets(
+                raw_logits, inds, nms_radius, H, W, subpixel_temp
             )
             kps_subpixel = kps + keypoint_offsets
-            kps_subpixel = to_pixel_coords(kps_subpixel, H, W) - 0.5
+            kps_subpixel = self._to_pixel_coords(kps_subpixel, H, W) - 0.5
 
         # Convert to pixel coordinates
-        kps = to_pixel_coords(kps, H, W) - 0.5
-        # To indices
+        kps = self._to_pixel_coords(kps, H, W) - 0.5
+
+        # Convert to flat indices
         idxs = kps[..., 1] * W + kps[..., 0]
         idxs = idxs.long()
         idxs = torch.clamp(idxs, min=0, max=W * H - 1)
 
-        if subpixel:
+        if subpixel and raw_logits is not None:
             kps = kps_subpixel
 
         return idxs, kps
 
-    def _forward(self, data):
-
-        if "total_n_samples" in data:  # TODO(Abhiram): Any other way to do this?
-            # Print only once that the constants are being updated
-            if not hasattr(self, "_printed_constants_update"):
-                print("Updating constants...")
-                self._printed_constants_update = True
-            self._update_constants(data)
-
+    def _forward(self, data: dict) -> dict:
+        """Forward pass through the RaCo model."""
+        # Preprocess image
         image = data["image"]
         if image.shape[1] == 1:
             image = image.repeat(1, 3, 1, 1)  # Convert to 3-channel greyscale
-        image = self.normalizer(image)  # imagenet normalization the image
+        image = self.normalizer(image)
 
+        # Forward through model
         raw_score_map, ranker_map, cov_maps = self.model(image)
 
-        # Batchwise global softmax normalization
+        # Compute probability maps using batchwise global softmax normalization
         logx = nn.functional.log_softmax(raw_score_map.flatten(1), dim=1).reshape(
             raw_score_map.size()
         )
         x = torch.exp(logx)
 
+        # Sample keypoints
         kps = None
-        idxs, kps = self._balanced_sampling(
+        idxs, kps = self._sampling(
             keypoint_probs=x,
             nms_radius=self.conf.nms_radius,
             raw_logits=raw_score_map,
@@ -225,11 +319,13 @@ class RaCo(BaseModel):
         B, _, H, W = x.size()
         probs = x.view(B, -1).gather(1, idxs.view(B, -1))
 
+        # Apply detection threshold if configured
         if self.conf.detection_threshold > 0:
             mask = probs > self.conf.detection_threshold
-            idxs = idxs[mask].view(B, -1)
-            probs = probs[mask].view(B, -1)
+            idxs = idxs[mask].view(idxs.shape[0], -1)
+            probs = probs[mask].view(probs.shape[0], -1)
 
+        # Convert indices to coordinates
         xs = idxs % W
         ys = idxs // W
         keypoints = torch.stack([xs, ys], dim=-1).float() if kps is None else kps
@@ -238,18 +334,31 @@ class RaCo(BaseModel):
         log_probs = logx.view(B, -1).gather(1, idxs.view(B, -1))
         raw_keypoint_scores = raw_score_map.reshape(B, -1).gather(1, idxs.view(B, -1))
 
-        ranker_scores = None
-        if self.conf.ranker:
-            ranker_scores = ranker_map.reshape(B, -1).gather(1, idxs.view(B, -1))
-            ranker_scores = ranker_scores.view(B, -1)
+        # Build output dictionary, excluding None values
+        out_dict = {
+            # Heatmaps
+            "heatmap": x,  # (B, 1, H, W)
+            "raw_logits": raw_score_map,  # (B, 3, H, W)
+            # Points, add 0.5 to center the keypoints
+            "keypoints": keypoints + 0.5,  # (B, N, 2)
+            "keypoint_scores": probs,  # (B, N)
+            "log_keypoint_scores": log_probs,  # (B, N)
+            "raw_keypoint_scores": raw_keypoint_scores,  # (B, N)
+        }
 
-        cholesky_scores, means = None, None
+        # Add optional outputs only if they exist
+        if self.conf.ranker and ranker_map is not None:
+            # Higher the ranker score, better the keypoint
+            out_dict["ranker_map"] = ranker_map
+            ranker_scores = ranker_map.reshape(B, -1).gather(1, idxs.view(B, -1))
+            out_dict["ranker_scores"] = ranker_scores.view(B, -1)  # (B, N)
+
         if self.conf.covariance_estimator and cov_maps is not None:
             # Apply activations to ensure L11 and L22 are positive
-            # cov_maps has shape (B, 5, H, W) with [L11_prime, L21, L22_prime, mean_x, mean_y]
+            # cov_maps has shape (B, 3, H, W) with [L11_prime, L21, L22_prime]
             var_activation = nn.Softplus()
 
-            cov_maps = torch.stack(
+            processed_cov_maps = torch.stack(
                 [
                     var_activation(cov_maps[:, 0, ...]),  # L11
                     cov_maps[:, 1, ...],  # L21 (no constraint)
@@ -259,34 +368,19 @@ class RaCo(BaseModel):
             )
             # Sample the cholesky elements at the keypoints
             cholesky_scores = (
-                cov_maps.view(B, 3, -1)
+                processed_cov_maps.view(B, 3, -1)
                 .gather(2, idxs.unsqueeze(1).expand(B, 3, -1))
                 .permute(0, 2, 1)
             )  # (B, N, 3)
 
-        out_dict = {
-            # Heatmaps
-            "heatmap": x,
-            "raw_logits": raw_score_map,
-            "ranker_map": ranker_map,
-            "cholesky_elements_heatmap": (
-                cov_maps[:, :3, ...] if self.conf.covariance_estimator else None
-            ),
-            "means_heatmap": cov_maps[:, 3:, ...],
-            # Points
-            "keypoints": keypoints + 0.5,  # Add 0.5 to center the keypoints
-            "keypoint_scores": probs,
-            "log_keypoint_scores": log_probs,
-            "raw_keypoint_scores": raw_keypoint_scores,
-            "ranker_scores": ranker_scores,
-            "cholesky_scores": cholesky_scores,
-            "means": means,
-        }
+            covariances = covariance_matrix_from_cholesky_elements(cholesky_scores)
+
+            out_dict["covariances"] = covariances  # (B, N, 2, 2)
 
         return out_dict
 
     def loss(self):
-        return NotImplementedError
+        raise NotImplementedError("Loss computation not yet implemented")
 
 
 if __name__ == "__main__":
