@@ -2,3 +2,41 @@ model:
   name: two_view_pipeline
   extractor:
     name: extractors.raco
+
+benchmarks:
+  hpatches:
+    data:
+      preprocessing:
+        resize: 640
+    model:
+      extractor:
+        max_num_keypoints: 1024
+      matcher:
+        name: homography_matcher
+        th_positive: 3
+        th_negative: 3
+    eval:
+      estimator: poselib
+      ransac_th: -1
+  megadepth1500:
+    data:
+      preprocessing:
+        resize: 1600
+    model:
+      extractor:
+        max_num_keypoints: 2048
+      matcher:
+        name: depth_matcher
+        th_positive: 5
+        th_negative: 5
+    eval:
+      estimator: poselib
+      ransac_th: -1
+  eth3d:
+    model:
+      extractor:
+        max_num_keypoints: 2048
+  rotation_hpatches:
+    model:
+      extractor:
+        max_num_keypoints: 200

@@ -5,7 +5,11 @@ from kornia.geometry.homography import find_homography_dlt
 from ..geometry.depth import symmetric_reprojection_error
 from ..geometry.epipolar import generalized_epi_dist, relative_pose_error
 from ..geometry.gt_generation import IGNORE_FEATURE, gt_matches_from_pose_depth
-from ..geometry.homography import homography_corner_error, sym_homography_error
+from ..geometry.homography import (
+    homography_corner_error,
+    is_inside_img,
+    sym_homography_error,
+)
 from ..robust_estimators import load_estimator
 from ..utils.tensor import batch_to_device, index_batch
 from ..utils.tools import AUCMetric
@@ -16,7 +20,7 @@ def check_keys_recursive(d, pattern):
         {check_keys_recursive(d[k], v) for k, v in pattern.items()}
     else:
         for k in pattern:
-            assert k in d.keys()
+            assert k in d.keys(), "Key {} not found in dict".format(k)
 
 
 def get_matches_scores(kpts0, kpts1, matches0, mscores0):
@@ -335,3 +339,125 @@ def aggregate_pr_results(results, suffix=""):
     out["curve_precision" + suffix] = tp_vals / np.maximum(tp_vals + fp_vals, 1e-9)
     out["AP" + suffix] = AP(tp_vals, fp_vals) * 100
     return out
+
+
+def get_valid_kpts(proj_kpts, img_size):
+    """
+    img_size = data["view0"]["image"].shape[-2:] = (h, w)
+    """
+    valid_mask = is_inside_img(proj_kpts, img_size)
+    return proj_kpts[valid_mask]
+
+
+def eval_repeatability_loc_error(
+    data: dict, pred: dict, match_thresholds: list = [1, 2, 3]
+) -> dict:
+    """
+    Evaluate repeatability and localization error for keypoint detection.
+
+    Args:
+        data: Dictionary containing view0 and view1 data
+        pred: Dictionary containing keypoints, matches, and projections
+        match_thresholds: List of pixel thresholds for evaluation
+
+    Returns:
+        Dictionary with repeatability and localization error metrics
+    """
+    # Validate required keys
+    check_keys_recursive(data, ["view0", "view1"])
+    check_keys_recursive(
+        pred,
+        [
+            "keypoints0",
+            "keypoints1",
+            "proj_0to1",
+            "proj_1to0",
+            "matches0",
+            "matches1",
+        ],
+    )
+
+    # Handle batched inputs
+    if pred["keypoints0"].ndim > 2:
+        return eval_per_batch_item(
+            data, pred, eval_repeatability_loc_error, match_thresholds=match_thresholds
+        )
+
+    # Extract data
+    kp0, kp1 = pred["keypoints0"], pred["keypoints1"]
+    m0, m1 = pred["matches0"], pred["matches1"]
+    proj0to1, proj1to0 = pred["proj_0to1"], pred["proj_1to0"]
+    valid_matches = m0.detach().cpu() > -1
+
+    # Get valid keypoints within image boundaries
+    img_shape0 = data["view0"]["image"].shape[-2:]
+    img_shape1 = data["view1"]["image"].shape[-2:]
+
+    valid_kpts0 = get_valid_kpts(proj0to1, img_shape1)
+    valid_kpts1 = get_valid_kpts(proj1to0, img_shape0)
+
+    # Calculate repeatability
+    num_matches0 = (m0 > -1).sum().item()
+    num_matches1 = (m1 > -1).sum().item()
+
+    # Avoid division by zero
+    num_valid_kpts0 = len(valid_kpts0)
+    num_valid_kpts1 = len(valid_kpts1)
+
+    rep0 = num_matches0 / (num_valid_kpts0 + 1e-6)
+    rep1 = num_matches1 / (num_valid_kpts1 + 1e-6)
+    repeatability = (rep0 + rep1) / 2
+
+    # Calculate localization error
+    matched_kp0 = kp0[valid_matches]
+    matched_kp1 = kp1[m0[valid_matches]]
+    proj_matched_kp0 = proj0to1[valid_matches]
+    proj_matched_kp1 = proj1to0[m0[valid_matches]]
+
+    # Compute localization errors
+    loc_error0 = np.linalg.norm(
+        matched_kp0.cpu().numpy() - proj_matched_kp1.cpu().numpy(), axis=1
+    )
+    loc_error1 = np.linalg.norm(
+        matched_kp1.cpu().numpy() - proj_matched_kp0.cpu().numpy(), axis=1
+    )
+
+    # Filter outliers
+    filtered_error0 = loc_error0
+    filtered_error1 = loc_error1
+
+    # Compute average localization error
+    avg_loc_error = (np.mean(filtered_error0) + np.mean(filtered_error1)) / 2
+
+    # Build output dictionary
+    results = {"repeatability": repeatability, "localization_error": avg_loc_error}
+
+    # Add threshold-specific metrics
+    if match_thresholds is not None:
+        for threshold in match_thresholds:
+            # Count valid matches within threshold
+            valid_error0 = filtered_error0 < threshold
+            valid_error1 = filtered_error1 < threshold
+            num_valid0 = valid_error0.sum()
+            num_valid1 = valid_error1.sum()
+
+            # Calculate threshold-specific repeatability
+            threshold_rep0 = num_valid0 / (num_valid_kpts0 + 1e-6)
+            threshold_rep1 = num_valid1 / (num_valid_kpts1 + 1e-6)
+            results[f"repeatability@{threshold}px"] = (
+                threshold_rep0 + threshold_rep1
+            ) / 2
+
+            # Calculate threshold-specific localization error
+            if num_valid0 > 0 and num_valid1 > 0:
+                threshold_loc_error = (
+                    filtered_error0[valid_error0].mean()
+                    + filtered_error1[valid_error1].mean()
+                ) / 2
+                results[f"localization_error@{threshold}px"] = threshold_loc_error
+
+    # Sanity check
+    if repeatability > 1 or repeatability < 0:
+        print(f"Warning: Repeatability {repeatability:.3f} should be in [0, 1]")
+
+    return results

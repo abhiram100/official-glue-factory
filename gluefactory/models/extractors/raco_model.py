@@ -72,7 +72,6 @@ class ResBlock(nn.Module):
         planes: int,
     ) -> None:
         super(ResBlock, self).__init__()
-        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
         self.conv1 = nn.Conv2d(
             inplanes,
             planes,

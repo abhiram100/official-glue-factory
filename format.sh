@@ -1,3 +1,3 @@
-python -m flake8 .
-python -m isort .
-python -m black .
+python -m flake8 . --exclude=glue
+python -m isort . --skip glue
+python -m black . --exclude glue

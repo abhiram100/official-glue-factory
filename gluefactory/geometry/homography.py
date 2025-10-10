@@ -198,12 +198,13 @@ def seg_equation(segs):
     return lines
 
 
-def is_inside_img(pts: torch.Tensor, img_shape: Tuple[int, int]):
+def is_inside_img(pts: torch.Tensor, img_shape: Tuple[int, int], match_radius: int = 0):
+    assert match_radius >= 0, "match_radius should be a non-negative integer"
     h, w = img_shape
     return (
-        (pts >= 0).all(dim=-1)
-        & (pts[..., 0] < w)
-        & (pts[..., 1] < h)
+        (pts >= -match_radius).all(dim=-1)
+        & (pts[..., 0] < w + match_radius)
+        & (pts[..., 1] < h + match_radius)
         & (~torch.isinf(pts).any(dim=-1))
     )
 

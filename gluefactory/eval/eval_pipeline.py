@@ -66,7 +66,7 @@ class EvalPipeline:
         pass
 
     @classmethod
-    def get_dataloader(self, data_conf=None):
+    def get_dataloader(cls, data_conf=None):
         """Returns a data loader with samples for each eval datapoint"""
         raise NotImplementedError
 
@@ -93,7 +93,7 @@ class EvalPipeline:
         f = {}
         if not exists_eval(experiment_dir) or overwrite_eval or overwrite:
             logger.info(f"Loop 2: Evaluating predictions in {pred_file}.")
-            s, f, r = self.run_eval(self.get_dataloader(), pred_file)
+            s, f, r = self.run_eval(self.get_dataloader(self.conf.data), pred_file)
             save_eval(experiment_dir, s, f, r)
             logger.info(f"Loop 2 finished. Results saved to {experiment_dir}.")
         s, r = load_eval(experiment_dir)
