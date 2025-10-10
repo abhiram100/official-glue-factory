@@ -1,0 +1,4 @@
+model:
+  name: two_view_pipeline
+  extractor:
+    name: extractors.raco
