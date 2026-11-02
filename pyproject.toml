@@ -27,7 +27,7 @@ dependencies = [
     "h5py",
     "omegaconf",
     "tensorboard",
-    "albumentations",
+    "albumentations<2",
     "kornia",
     "seaborn",
     "joblib",
@@ -37,6 +37,11 @@ dependencies = [
 urls = {Repository = "https://github.com/cvg/glue-factory"}
 
 [project.optional-dependencies]
+raco = [
+    "torch>=2.1",
+    "albumentations>=1.4.24,<2",
+    "fast-soft-sort @ git+https://github.com/google-research/fast-soft-sort.git@6a52ce79869ab16e1e0f39149a84f50f8ad648c5",
+]
 extra = [
     "pycolmap",
     "poselib",
@@ -50,7 +55,11 @@ dev = ["black", "flake8", "isort", "parameterized"]
 include = ["gluefactory*"]
 
 [tool.setuptools.package-data]
-gluefactory = ["datasets/megadepth_scene_lists/*.txt", "configs/*.yaml"]
+gluefactory = [
+    "datasets/megadepth_scene_lists/*.txt",
+    "configs/*.yaml",
+    "configs/raco_training/*.yaml",
+]
 
 [tool.isort]
 profile = "black"

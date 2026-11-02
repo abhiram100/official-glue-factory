@@ -1,0 +1,55 @@
+data:
+  name: homographies
+  data_dir: revisitop1m
+  image_dir: jpg
+  image_list: revisitop1m.txt
+  train_size: 400000
+  val_size: 1000
+  batch_size: 2
+  num_workers: 4
+  right_only: false
+  p_random_rotations: 0.5
+  corner_origin: true
+  homography:
+    translation: 0.5
+    difficulty: 0.75
+    max_angle: 45
+    n_angles: 11
+    patch_shape:
+    - 640
+    - 640
+  photometric:
+    name: raco
+    p: 0.95
+  grayscale: false
+  crop_size:
+  - 768
+  - 768
+model:
+  name: two_view_pipeline
+  extractor:
+    name: extractors.raco
+    trainable: true
+    weights: null
+    heads_to_train:
+    - ranking
+    max_sampled_keypoints: 512
+    max_num_keypoints: 512
+    nms_radius: 3
+    subpixel_sampling: true
+train:
+  seed: 0
+  epochs: 1
+  optimizer: adamw
+  optimizer_options:
+    weight_decay: 1.0e-05
+  lr: 0.0002
+  lr_schedule:
+    type: CosineAnnealingLR
+    options:
+      T_max: 200000
+      eta_min: 1.0e-06
+  log_every_iter: 500
+  eval_every_iter: 5000
+  best_key: loss/total
+  clip_grad: 1

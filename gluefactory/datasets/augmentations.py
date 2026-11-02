@@ -25,7 +25,7 @@ class RandomAdditiveShade(A.ImageOnlyTransform):
         always_apply=False,
         p=0.5,
     ):
-        super().__init__(always_apply, p)
+        super().__init__(always_apply=always_apply, p=p)
         self.nb_ellipses = nb_ellipses
         self.transparency_limit = transparency_limit
         self.kernel_size_limit = kernel_size_limit
@@ -243,7 +243,24 @@ class LGAugmentation(BaseAugmentation):
         ]
 
 
+class RaCoAugmentation(BaseAugmentation):
+    default_conf = {"p": 0.95}
+
+    def _init(self, conf):
+        self.transforms = [
+            A.RandomBrightnessContrast(
+                p=0.6, brightness_limit=(-0.3, 0.3), contrast_limit=(-0.3, 0.3)
+            ),
+            A.OneOf([A.ISONoise()], p=0.1),
+            A.ImageCompression(p=0.7, quality_range=(25, 95)),
+            A.GaussNoise(p=0.5, std_range=(0.03, 0.03), mean_range=(0, 0)),
+            RandomAdditiveShade(p=0.5, transparency_limit=(0.2, 0.7)),
+            RandomAdditiveShade(p=0.5, transparency_limit=(-0.7, 0.2)),
+        ]
+
+
 augmentations = {
+    "raco": RaCoAugmentation,
     "dark": DarkAugmentation,
     "lg": LGAugmentation,
     "identity": IdentityAugmentation,

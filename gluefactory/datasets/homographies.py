@@ -44,6 +44,46 @@ def sample_homography(img, conf: dict, size: list):
     return data
 
 
+def rotate_quarter_turns(data, k):
+    """Rotate an integer-center view counterclockwise by k quarter turns.
+
+    Odd k swaps height and width, so non-square views must use even k.
+    """
+    h, w = data["image"].shape[-2:]
+    assert k % 2 == 0 or h == w, f"Odd quarter turns need a square view, got {h}x{w}"
+    rotation = np.eye(3, dtype=np.float32)
+    for _ in range(k):
+        rotation = np.array([[0, 1, 0], [-1, 0, w - 1], [0, 0, 1]]) @ rotation
+        h, w = w, h
+    data["image"] = torch.rot90(data["image"], k, (-2, -1))
+    data["H_"] = (rotation @ data["H_"]).astype(np.float32)
+    data["coords"] = warp_points(data["coords"], rotation, inverse=False).astype(
+        np.float32
+    )
+    data["image_size"] = np.array([w, h], dtype=np.float32)
+    return data
+
+
+def center_crop(img, crop_size):
+    """Center-crop an image; images smaller than the crop are returned unchanged."""
+    if crop_size is None:
+        return img
+    ch, cw = crop_size
+    h, w = img.shape[:2]
+    if h < ch or w < cw:
+        return img
+    y, x = (h - ch) // 2, (w - cw) // 2
+    return img[y : y + ch, x : x + cw]
+
+
+def to_corner_origin(data):
+    """Shift H_ and coords so pixel (0, 0) is centered at (0.5, 0.5)."""
+    shift = np.array([[1, 0, 0.5], [0, 1, 0.5], [0, 0, 1]])
+    data["H_"] = (shift @ data["H_"] @ np.linalg.inv(shift)).astype(np.float32)
+    data["coords"] = data["coords"] + 0.5
+    return data
+
+
 class HomographyDataset(BaseDataset):
     default_conf = {
         # image search
@@ -56,11 +96,15 @@ class HomographyDataset(BaseDataset):
         "train_size": 100,
         "val_size": 10,
         "shuffle_seed": 0,  # or None to skip
+        "train_num_samples": None,  # optional: train on a subset, same val split
         # image loading
         "grayscale": False,
         "triplet": False,
         "right_only": False,  # image0 is orig (rescaled), image1 is right
         "reseed": False,
+        "crop_size": None,  # optional [h, w] center crop before warping
+        "p_random_rotations": 0.0,  # probability of a random quarter turn per view
+        "corner_origin": False,  # H_ and coords with pixel (0, 0) at (0.5, 0.5)
         "homography": {
             "difficulty": 0.8,
             "translation": 1.0,
@@ -86,6 +130,9 @@ class HomographyDataset(BaseDataset):
     }
 
     def _init(self, conf):
+        pw, ph = conf.homography.patch_shape
+        if conf.p_random_rotations > 0 and pw != ph:
+            raise ValueError("Random quarter turns require a square patch_shape")
         data_dir = DATA_PATH / conf.data_dir
         if not data_dir.exists():
             if conf.data_dir == "revisitop1m":
@@ -149,7 +196,10 @@ class HomographyDataset(BaseDataset):
         shutil.move(tmp_dir, data_dir)
 
     def get_dataset(self, split):
-        return _Dataset(self.conf, self.images[split], split)
+        images = self.images[split]
+        if split == "train" and self.conf.train_num_samples is not None:
+            images = images[: self.conf.train_num_samples]
+        return _Dataset(self.conf, images, split)
 
 
 class _Dataset(torch.utils.data.Dataset):
@@ -214,6 +264,12 @@ class _Dataset(torch.utils.data.Dataset):
         else:
             return self.getitem(idx)
 
+    def _maybe_rotate(self, data, left):
+        p = self.conf.p_random_rotations
+        if p > 0 and not (left and self.conf.right_only) and np.random.rand() < p:
+            data = rotate_quarter_turns(data, np.random.randint(1, 4))
+        return data
+
     def _read_view(self, img, H_conf, ps, left=False):
         data = sample_homography(img, H_conf, ps)
         if left:
@@ -224,6 +280,10 @@ class _Dataset(torch.utils.data.Dataset):
         gs = data["image"].new_tensor([0.299, 0.587, 0.114]).view(3, 1, 1)
         if self.conf.grayscale:
             data["image"] = (data["image"] * gs).sum(0, keepdim=True)
+
+        data = self._maybe_rotate(data, left)
+        if self.conf.corner_origin:
+            data = to_corner_origin(data)
 
         if self.conf.load_features.do:
             features = self.feature_loader({k: [v] for k, v in data.items()})
@@ -239,6 +299,7 @@ class _Dataset(torch.utils.data.Dataset):
             logging.warning("Image %s could not be read.", name)
             img = np.zeros((1024, 1024) + (() if self.conf.grayscale else (3,)))
         img = img.astype(np.float32) / 255.0
+        img = center_crop(img, self.conf.crop_size)
         size = img.shape[:2][::-1]
         ps = self.conf.homography.patch_shape
 

@@ -1,0 +1,7 @@
+model:
+  name: two_view_pipeline
+  extractor:
+    name: extractors.raco
+    trainable: false
+    weights: https://github.com/cvg/RaCo/releases/download/v1.0.0/raco.pth
+    max_num_keypoints: 2048

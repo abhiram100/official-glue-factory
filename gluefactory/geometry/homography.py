@@ -158,6 +158,18 @@ def warp_points(points, homography, inverse=True):
     return warped_points[0] if len(homography.shape) == 2 else warped_points
 
 
+def _autocast_disabled(device):
+    """Context manager that disables autocast on the given device."""
+    if hasattr(torch, "autocast"):
+        return torch.autocast(device_type=device.type, enabled=False)
+    return torch.cuda.amp.autocast(enabled=False)
+
+
+def _upcast_half(x):
+    """Cast float16/bfloat16 tensors to float32, leaving other dtypes unchanged."""
+    return x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+
+
 def warp_points_torch(points, H, inverse=True):
     """
     Warp a list of points with the INVERSE of the given homography.
@@ -169,14 +181,18 @@ def warp_points_torch(points, H, inverse=True):
     Returns: a Tensor of shape (B, N, 2) containing the new coordinates of the warps.
     """
 
-    # Get the points to the homogeneous format
-    points = to_homogeneous(points)
+    # Keep pixel geometry precise even when the caller enables mixed precision.
+    with _autocast_disabled(points.device):
+        points, H = _upcast_half(points), _upcast_half(H)
 
-    # Apply the homography
-    H_mat = (torch.inverse(H) if inverse else H).transpose(-2, -1)
-    warped_points = torch.einsum("...nj,...ji->...ni", points, H_mat)
+        # Get the points to the homogeneous format
+        points = to_homogeneous(points)
 
-    warped_points = from_homogeneous(warped_points, eps=1e-5)
+        # Apply the homography
+        H_mat = (torch.inverse(H) if inverse else H).transpose(-2, -1)
+        warped_points = torch.einsum("...nj,...ji->...ni", points, H_mat)
+
+        warped_points = from_homogeneous(warped_points, min_abs=1e-8)
     return warped_points
 
 

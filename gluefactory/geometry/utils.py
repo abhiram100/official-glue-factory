@@ -19,15 +19,30 @@ def to_homogeneous(points):
         raise ValueError
 
 
-def from_homogeneous(points, eps=0.0):
+def from_homogeneous(points, eps=0.0, min_abs=0.0):
     """Remove the homogeneous dimension of N-dimensional points.
     Args:
         points: torch.Tensor or numpy.ndarray with size (..., N+1).
-        eps: Epsilon value to prevent zero division.
+        eps: Value added to the denominator for backward compatibility.
+        min_abs: Minimum absolute denominator, preserving its sign.
     Returns:
         A torch.Tensor or numpy ndarray with size (..., N).
     """
-    return points[..., :-1] / (points[..., -1:] + eps)
+    denominator = points[..., -1:] + eps
+    if min_abs > 0:
+        if isinstance(points, torch.Tensor):
+            denominator = torch.where(
+                denominator >= 0,
+                denominator.clamp_min(min_abs),
+                denominator.clamp_max(-min_abs),
+            )
+        else:
+            denominator = np.where(
+                denominator >= 0,
+                np.maximum(denominator, min_abs),
+                np.minimum(denominator, -min_abs),
+            )
+    return points[..., :-1] / denominator
 
 
 def batched_eye_like(x: torch.Tensor, n: int):

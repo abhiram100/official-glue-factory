@@ -332,6 +332,23 @@ Using the following local feature extractors:
 | [DISK](https://github.com/cvlab-epfl/disk) | `disk+lightglue_{homography,megadepth}.yaml` |
 | Key.Net + HardNet | ❌ TODO |
 
+## RaCo
+
+[RaCo](https://github.com/cvg/RaCo) adds keypoint ranking and covariance
+prediction to Glue Factory's local-feature pipeline. This repository provides
+the detector, covariance, and ranker training implementation, staged configs,
+and pretrained matching examples.
+
+- Follow the [RaCo training guide](docs/train_raco.md) for the three training
+  stages and checkpoint handoffs.
+- See the [Glue Factory RaCo guide](docs/raco.md) for pretrained configs,
+  matching, and pixel-coordinate conventions.
+- For standalone inference and visualization, use the RaCo release's
+  [keypoint/covariance demo](https://github.com/cvg/RaCo/blob/main/demo.ipynb)
+  and [matching demo](https://github.com/cvg/RaCo/blob/main/matching_demo.ipynb).
+- Glue Factory checkpoints load directly in the standalone RaCo package with
+  the [checkpoint-loading update](https://github.com/cvg/RaCo/pull/12).
+
 ## Coming soon
 - [ ] More baselines (LoFTR, ASpanFormer, MatchFormer, SGMNet, DKM, RoMa)
 - [ ] Training deep detectors and descriptors like SuperPoint
@@ -360,5 +377,16 @@ Please consider citing the following papers if you found this library useful:
                Viktor Larsson},
   booktitle = {International Conference on Computer Vision (ICCV)},
   year      = {2023}
+}
+```
+```bibtex
+@InProceedings{shenoi2026raco,
+  title     = {{RaCo: Ranking and Covariance for Practical Learned Keypoints}},
+  author    = {Abhiram Shenoi and
+               Philipp Lindenberger and
+               Paul-Edouard Sarlin and
+               Marc Pollefeys},
+  booktitle = {International Conference on 3D Vision},
+  year      = {2026}
 }
 ```
